@@ -1,0 +1,109 @@
+#include <Arduino.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/timers.h>
+
+// Configuración de pines (ESP32)
+const uint8_t PIN_BOTON = 4;   // GPIO4 - Conectar botón entre este pin y GND
+const uint8_t PIN_LED = 2;     // GPIO2 - LED integrado en muchas placas ESP32
+
+// Handles de FreeRTOS
+TimerHandle_t tmrBoton = NULL;
+TaskHandle_t tareaLEDHandle = NULL;
+
+// Variables compartidas (protegidas por notificaciones)
+volatile uint32_t tiempoPulsacion = 0;  // Tiempo en ms
+volatile bool debeParpadear = false;
+
+// Tarea para controlar el LED
+void tareaLED(void *pvParameters) {
+  pinMode(PIN_LED, OUTPUT);
+  digitalWrite(PIN_LED, LOW);
+
+  while(1) {
+    // Esperar notificación
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+    if(debeParpadear) {
+      uint32_t tiempoParpadeo = tiempoPulsacion;
+      uint16_t medioPeriodo = tiempoParpadeo / 20;  // 10 ciclos completos
+      medioPeriodo = max(medioPeriodo, 10);         // Mínimo 10ms
+
+      // Secuencia de parpadeo
+      for(int i=0; i<20; i++) {
+        digitalWrite(PIN_LED, !digitalRead(PIN_LED));
+        vTaskDelay(pdMS_TO_TICKS(medioPeriodo));
+      }
+
+      digitalWrite(PIN_LED, LOW);
+      debeParpadear = false;
+    } else {
+      // Encendido inmediato
+      digitalWrite(PIN_LED, HIGH);
+    }
+  }
+}
+
+// ISR del botón (con debounce software)
+void IRAM_ATTR isrBoton() {
+  static uint32_t ultimaInterrupcion = 0;
+  static BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+
+  uint32_t ahora = xTaskGetTickCountFromISR();
+  
+  // Debounce: ignorar interrupciones con menos de 50ms entre ellas
+  if((ahora - ultimaInterrupcion) > pdMS_TO_TICKS(50)) {
+    if(digitalRead(PIN_BOTON) == LOW) {  // Presionado (LOW porque usamos PULLUP)
+      // Iniciar temporizador (1 tick = 1ms)
+      xTimerStartFromISR(tmrBoton, &xHigherPriorityTaskWoken);
+      // Notificar encendido LED
+      xTaskNotifyFromISR(tareaLEDHandle, 0, eNoAction, &xHigherPriorityTaskWoken);
+    } else {  // Liberado
+      // Detener temporizador y guardar tiempo
+      tiempoPulsacion = xTimerStopFromISR(tmrBoton, &xHigherPriorityTaskWoken);
+      // Activar parpadeo
+      debeParpadear = true;
+      xTaskNotifyFromISR(tareaLEDHandle, 0, eNoAction, &xHigherPriorityTaskWoken);
+    }
+  }
+  ultimaInterrupcion = ahora;
+
+  if(xHigherPriorityTaskWoken == pdTRUE) {
+    portYIELD_FROM_ISR();
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  
+  // Configurar botón con resistencia PULLUP
+  pinMode(PIN_BOTON, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(PIN_BOTON), isrBoton, CHANGE);
+
+  // Crear temporizador para medir pulsación (resolución 1ms)
+  tmrBoton = xTimerCreate(
+    "tmrBoton",
+    pdMS_TO_TICKS(1),  // Periodo de 1ms
+    pdTRUE,            // Auto-reload
+    NULL,
+    NULL
+  );
+
+  // Crear tarea para el LED (núcleo 1 si hay dos núcleos)
+  xTaskCreatePinnedToCore(
+    tareaLED,
+    "tareaLED",
+    2048,
+    NULL,
+    2,
+    &tareaLEDHandle,
+    1  // Núcleo 1 (el 0 suele usarse para WiFi/BT)
+  );
+
+  Serial.println("Sistema iniciado");
+}
+
+void loop() {
+  // Nada aquí - todo se maneja por RTOS
+  vTaskDelay(portMAX_DELAY);
+}
